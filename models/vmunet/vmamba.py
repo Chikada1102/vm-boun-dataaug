@@ -34,12 +34,13 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
     D: r(D)
     z: r(B D L)
     delta_bias: r(D), fp32
-
+    
     ignores:
-        [.float(), +, .softplus, .shape, new_zeros, repeat, stack, to(dtype), silu]
+        [.float(), +, .softplus, .shape, new_zeros, repeat, stack, to(dtype), silu] 
     """
     import numpy as np
-
+    
+    # fvcore.nn.jit_handles
     def get_flops_einsum(input_shapes, equation):
         np_arrs = [np.zeros(s) for s in input_shapes]
         optim = np.einsum_path(equation, *np_arrs, optimize="optimal")[1]
@@ -48,27 +49,97 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
                 # divided by 2 because we count MAC (multiply-add counted as one flop)
                 flop = float(np.floor(float(line.split(":")[-1]) / 2))
                 return flop
-        return 0
+    
 
     assert not with_complex
 
-    flops = 0
+    flops = 0 # below code flops = 0
+    if False:
+        ...
+        """
+        dtype_in = u.dtype
+        u = u.float()
+        delta = delta.float()
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None].float()
+        if delta_softplus:
+            delta = F.softplus(delta)
+        batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+        is_variable_B = B.dim() >= 3
+        is_variable_C = C.dim() >= 3
+        if A.is_complex():
+            if is_variable_B:
+                B = torch.view_as_complex(rearrange(B.float(), "... (L two) -> ... L two", two=2))
+            if is_variable_C:
+                C = torch.view_as_complex(rearrange(C.float(), "... (L two) -> ... L two", two=2))
+        else:
+            B = B.float()
+            C = C.float()
+        x = A.new_zeros((batch, dim, dstate))
+        ys = []
+        """
+
     flops += get_flops_einsum([[B, D, L], [D, N]], "bdl,dn->bdln")
     if with_Group:
         flops += get_flops_einsum([[B, D, L], [B, N, L], [B, D, L]], "bdl,bnl,bdl->bdln")
     else:
         flops += get_flops_einsum([[B, D, L], [B, D, N, L], [B, D, L]], "bdl,bdnl,bdl->bdln")
-
-    in_for_flops = B * D * N
+    if False:
+        ...
+        """
+        deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+        if not is_variable_B:
+            deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+        else:
+            if B.dim() == 3:
+                deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+            else:
+                B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+                deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+        if is_variable_C and C.dim() == 4:
+            C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
+        last_state = None
+        """
+    
+    in_for_flops = B * D * N   
     if with_Group:
         in_for_flops += get_flops_einsum([[B, D, N], [B, D, N]], "bdn,bdn->bd")
     else:
         in_for_flops += get_flops_einsum([[B, D, N], [B, N]], "bdn,bn->bd")
-    flops += L * in_for_flops
+    flops += L * in_for_flops 
+    if False:
+        ...
+        """
+        for i in range(u.shape[2]):
+            x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+            if not is_variable_C:
+                y = torch.einsum('bdn,dn->bd', x, C)
+            else:
+                if C.dim() == 3:
+                    y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                else:
+                    y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+            if i == u.shape[2] - 1:
+                last_state = x
+            if y.is_complex():
+                y = y.real * 2
+            ys.append(y)
+        y = torch.stack(ys, dim=2) # (batch dim L)
+        """
+
     if with_D:
         flops += B * D * L
     if with_Z:
         flops += B * D * L
+    if False:
+        ...
+        """
+        out = y if D is None else y + u * rearrange(D, "d -> d 1")
+        if z is not None:
+            out = out * F.silu(z)
+        out = out.to(dtype=dtype_in)
+        """
+    
     return flops
 
 
@@ -130,47 +201,49 @@ class PatchMerging2D(nn.Module):
             x1 = x1[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
             x2 = x2[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
             x3 = x3[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
-
+        
         x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, H // 2, W // 2, 4 * C)  # B H/2*W/2 4*C
+        x = x.view(B, H//2, W//2, 4 * C)  # B H/2*W/2 4*C
 
         x = self.norm(x)
         x = self.reduction(x)
 
         return x
-
+    
 
 class PatchExpand2D(nn.Module):
     def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.dim = dim * 2
+        self.dim = dim*2
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(self.dim, dim_scale * self.dim, bias=False)
+        self.expand = nn.Linear(self.dim, dim_scale*self.dim, bias=False)
         self.norm = norm_layer(self.dim // dim_scale)
 
     def forward(self, x):
         B, H, W, C = x.shape
         x = self.expand(x)
-        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c',
-                      p1=self.dim_scale, p2=self.dim_scale, c=C // self.dim_scale)
-        x = self.norm(x)
-        return x
 
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=self.dim_scale, p2=self.dim_scale, c=C//self.dim_scale)
+        x= self.norm(x)
+
+        return x
+    
 
 class Final_PatchExpand2D(nn.Module):
     def __init__(self, dim, dim_scale=4, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(self.dim, dim_scale * self.dim, bias=False)
+        self.expand = nn.Linear(self.dim, dim_scale*self.dim, bias=False)
         self.norm = norm_layer(self.dim // dim_scale)
 
     def forward(self, x):
         B, H, W, C = x.shape
         x = self.expand(x)
-        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c',
-                      p1=self.dim_scale, p2=self.dim_scale, c=C // self.dim_scale)
-        x = self.norm(x)
+
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=self.dim_scale, p2=self.dim_scale, c=C//self.dim_scale)
+        x= self.norm(x)
+
         return x
 
 
@@ -218,10 +291,10 @@ class SS2D(nn.Module):
         self.act = nn.SiLU()
 
         self.x_proj = (
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs), 
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs), 
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs), 
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs), 
         )
         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0)) # (K=4, N, inner)
         del self.x_proj
@@ -235,7 +308,7 @@ class SS2D(nn.Module):
         self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0)) # (K=4, inner, rank)
         self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0)) # (K=4, inner)
         del self.dt_projs
-
+        
         self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True) # (K=4, D, N)
         self.Ds = self.D_init(self.d_inner, copies=4, merge=True) # (K=4, D, N)
 
@@ -251,7 +324,7 @@ class SS2D(nn.Module):
         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = dt_rank ** -0.5 * dt_scale
+        dt_init_std = dt_rank**-0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(dt_proj.weight, dt_init_std)
         elif dt_init == "random":
@@ -270,7 +343,7 @@ class SS2D(nn.Module):
             dt_proj.bias.copy_(inv_dt)
         # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
         dt_proj.bias._no_reinit = True
-
+        
         return dt_proj
 
     @staticmethod
@@ -304,7 +377,7 @@ class SS2D(nn.Module):
 
     def forward_corev0(self, x: torch.Tensor):
         self.selective_scan = selective_scan_fn
-
+        
         B, C, H, W = x.shape
         L = H * W
         K = 4
@@ -327,7 +400,7 @@ class SS2D(nn.Module):
         dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
 
         out_y = self.selective_scan(
-            xs, dts,
+            xs, dts, 
             As, Bs, Cs, Ds, z=None,
             delta_bias=dt_projs_bias,
             delta_softplus=True,
@@ -367,7 +440,7 @@ class SS2D(nn.Module):
         dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
 
         out_y = self.selective_scan(
-            xs, dts,
+            xs, dts, 
             As, Bs, Cs, Ds,
             delta_bias=dt_projs_bias,
             delta_softplus=True,
@@ -398,73 +471,6 @@ class SS2D(nn.Module):
         if self.dropout is not None:
             out = self.dropout(out)
         return out
-
-
-# ==================== 新添加的代码开始：RSSB 所需的通道注意力与卷积分支 ====================
-class ChannelAttention(nn.Module):
-    """Channel attention used in RCAN / MambaIR-style CAB."""
-
-    def __init__(self, num_feat, squeeze_factor=16):
-        super(ChannelAttention, self).__init__()
-        mid_channels = max(num_feat // squeeze_factor, 1)
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(num_feat, mid_channels, 1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, num_feat, 1, padding=0),
-            nn.Sigmoid())
-
-    def forward(self, x):
-        y = self.attention(x)
-        return x * y
-
-
-class CAB(nn.Module):
-    """Convolutional Channel Attention Block for the RSSB local enhancement branch."""
-
-    def __init__(self, num_feat, compress_ratio=3, squeeze_factor=16):
-        super(CAB, self).__init__()
-        mid_channels = max(num_feat // compress_ratio, 1)
-        self.cab = nn.Sequential(
-            nn.Conv2d(num_feat, mid_channels, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, num_feat, 3, 1, 1),
-            ChannelAttention(num_feat, squeeze_factor)
-        )
-
-    def forward(self, x):
-        return self.cab(x)
-
-
-class RSSB(nn.Module):
-    """Residual State Space Block: SS2D global modeling + CAB local/channel enhancement."""
-
-    def __init__(
-        self,
-        hidden_dim: int = 0,
-        drop_path: float = 0,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-        attn_drop_rate: float = 0,
-        d_state: int = 16,
-        **kwargs,
-    ):
-        super().__init__()
-        self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
-        self.drop_path = DropPath(drop_path)
-        self.skip_scale = nn.Parameter(torch.ones(hidden_dim))
-        self.conv_blk = CAB(hidden_dim)
-        self.ln_2 = norm_layer(hidden_dim)
-        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
-
-    def forward(self, input: torch.Tensor):
-        # input: B, H, W, C
-        x = input * self.skip_scale + self.drop_path(self.self_attention(self.ln_1(input)))
-        x = x * self.skip_scale2 + self.conv_blk(
-            self.ln_2(x).permute(0, 3, 1, 2).contiguous()
-        ).permute(0, 2, 3, 1).contiguous()
-        return x
-# ==================== 新添加的代码结束：RSSB 所需的通道注意力与卷积分支 ====================
 
 
 class VSSBlock(nn.Module):
@@ -501,42 +507,23 @@ class VSSLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        dim,
-        depth,
+        self, 
+        dim, 
+        depth, 
         attn_drop=0.,
-        drop_path=0.,
-        norm_layer=nn.LayerNorm,
-        downsample=None,
-        use_checkpoint=False,
+        drop_path=0., 
+        norm_layer=nn.LayerNorm, 
+        downsample=None, 
+        use_checkpoint=False, 
         d_state=16,
-        # ==================== 新添加的代码开始：控制 encoder stage 是否启用 RSSB ====================
-        use_rssb=False,
-        # ==================== 新添加的代码结束：控制 encoder stage 是否启用 RSSB ====================
         **kwargs,
     ):
         super().__init__()
         self.dim = dim
         self.use_checkpoint = use_checkpoint
-        # ==================== 新添加的代码开始：保存当前 stage 的 RSSB 开关 ====================
-        self.use_rssb = use_rssb
-        # ==================== 新添加的代码结束：保存当前 stage 的 RSSB 开关 ====================
 
-        # 原始代码保留但注释掉：原实现所有 encoder stage 都使用 VSSBlock
-        # self.blocks = nn.ModuleList([
-        #     VSSBlock(
-        #         hidden_dim=dim,
-        #         drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-        #         norm_layer=norm_layer,
-        #         attn_drop_rate=attn_drop,
-        #         d_state=d_state,
-        #     )
-        #     for i in range(depth)])
-
-        # ==================== 新添加的代码开始：encoder 后两层将由 VSSM 传入 use_rssb=True，从而调用 RSSB ====================
-        block_cls = RSSB if self.use_rssb else VSSBlock
         self.blocks = nn.ModuleList([
-            block_cls(
+            VSSBlock(
                 hidden_dim=dim,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
@@ -544,8 +531,7 @@ class VSSLayer(nn.Module):
                 d_state=d_state,
             )
             for i in range(depth)])
-        # ==================== 新添加的代码结束：encoder 后两层将由 VSSM 传入 use_rssb=True，从而调用 RSSB ====================
-
+        
         if True: # is this really applied? Yes, but been overriden later in VSSM!
             def _init_weights(module: nn.Module):
                 for name, p in module.named_parameters():
@@ -559,17 +545,19 @@ class VSSLayer(nn.Module):
         else:
             self.downsample = None
 
+
     def forward(self, x):
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
-
+        
         if self.downsample is not None:
             x = self.downsample(x)
 
         return x
+    
 
 
 class VSSLayer_up(nn.Module):
@@ -586,42 +574,23 @@ class VSSLayer_up(nn.Module):
     """
 
     def __init__(
-        self,
-        dim,
-        depth,
+        self, 
+        dim, 
+        depth, 
         attn_drop=0.,
-        drop_path=0.,
-        norm_layer=nn.LayerNorm,
-        upsample=None,
-        use_checkpoint=False,
+        drop_path=0., 
+        norm_layer=nn.LayerNorm, 
+        upsample=None, 
+        use_checkpoint=False, 
         d_state=16,
-        # ==================== 新添加的代码开始：控制 decoder stage 是否启用 RSSB ====================
-        use_rssb=False,
-        # ==================== 新添加的代码结束：控制 decoder stage 是否启用 RSSB ====================
         **kwargs,
     ):
         super().__init__()
         self.dim = dim
         self.use_checkpoint = use_checkpoint
-        # ==================== 新添加的代码开始：保存当前 decoder stage 的 RSSB 开关 ====================
-        self.use_rssb = use_rssb
-        # ==================== 新添加的代码结束：保存当前 decoder stage 的 RSSB 开关 ====================
 
-        # 原始代码保留但注释掉：原实现所有 decoder stage 都使用 VSSBlock
-        # self.blocks = nn.ModuleList([
-        #     VSSBlock(
-        #         hidden_dim=dim,
-        #         drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-        #         norm_layer=norm_layer,
-        #         attn_drop_rate=attn_drop,
-        #         d_state=d_state,
-        #     )
-        #     for i in range(depth)])
-
-        # ==================== 新添加的代码开始：decoder 前两层将由 VSSM 传入 use_rssb=True，从而调用 RSSB ====================
-        block_cls = RSSB if self.use_rssb else VSSBlock
         self.blocks = nn.ModuleList([
-            block_cls(
+            VSSBlock(
                 hidden_dim=dim,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
@@ -629,8 +598,7 @@ class VSSLayer_up(nn.Module):
                 d_state=d_state,
             )
             for i in range(depth)])
-        # ==================== 新添加的代码结束：decoder 前两层将由 VSSM 传入 use_rssb=True，从而调用 RSSB ====================
-
+        
         if True: # is this really applied? Yes, but been overriden later in VSSM!
             def _init_weights(module: nn.Module):
                 for name, p in module.named_parameters():
@@ -644,6 +612,7 @@ class VSSLayer_up(nn.Module):
         else:
             self.upsample = None
 
+
     def forward(self, x):
         if self.upsample is not None:
             x = self.upsample(x)
@@ -653,6 +622,7 @@ class VSSLayer_up(nn.Module):
             else:
                 x = blk(x)
         return x
+    
 
 
 class VSSM(nn.Module):
@@ -691,15 +661,12 @@ class VSSM(nn.Module):
                 dim=dims[i_layer],
                 depth=depths[i_layer],
                 d_state=math.ceil(dims[0] / 6) if d_state is None else d_state, # 20240109
-                drop=drop_rate,
+                drop=drop_rate, 
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
                 downsample=PatchMerging2D if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
-                # ==================== 新添加的代码开始：只在 encoder 后两层调用 RSSB 创新模块 ====================
-                use_rssb=(i_layer >= self.num_layers - 2),
-                # ==================== 新添加的代码结束：只在 encoder 后两层调用 RSSB 创新模块 ====================
             )
             self.layers.append(layer)
 
@@ -709,20 +676,17 @@ class VSSM(nn.Module):
                 dim=dims_decoder[i_layer],
                 depth=depths_decoder[i_layer],
                 d_state=math.ceil(dims[0] / 6) if d_state is None else d_state, # 20240109
-                drop=drop_rate,
+                drop=drop_rate, 
                 attn_drop=attn_drop_rate,
                 drop_path=dpr_decoder[sum(depths_decoder[:i_layer]):sum(depths_decoder[:i_layer + 1])],
                 norm_layer=norm_layer,
                 upsample=PatchExpand2D if (i_layer != 0) else None,
                 use_checkpoint=use_checkpoint,
-                # ==================== 新添加的代码开始：只在 decoder 前两层调用 RSSB 创新模块 ====================
-                use_rssb=(i_layer < 2),
-                # ==================== 新添加的代码结束：只在 decoder 前两层调用 RSSB 创新模块 ====================
             )
             self.layers_up.append(layer)
 
         self.final_up = Final_PatchExpand2D(dim=dims_decoder[-1], dim_scale=4, norm_layer=norm_layer)
-        self.final_conv = nn.Conv2d(dims_decoder[-1] // 4, num_classes, 1)
+        self.final_conv = nn.Conv2d(dims_decoder[-1]//4, num_classes, 1)
 
         # self.norm = norm_layer(self.num_features)
         # self.avgpool = nn.AdaptiveAvgPool1d(1)
@@ -736,7 +700,7 @@ class VSSM(nn.Module):
         no fc.weight found in the any of the model parameters
         no nn.Embedding found in the any of the model parameters
         so the thing is, VSSBlock initialization is useless
-
+        
         Conv2D is not intialized !!!
         """
         if isinstance(m, nn.Linear):
@@ -766,19 +730,19 @@ class VSSM(nn.Module):
             skip_list.append(x)
             x = layer(x)
         return x, skip_list
-
+    
     def forward_features_up(self, x, skip_list):
         for inx, layer_up in enumerate(self.layers_up):
             if inx == 0:
                 x = layer_up(x)
             else:
-                x = layer_up(x + skip_list[-inx])
+                x = layer_up(x+skip_list[-inx])
 
         return x
-
+    
     def forward_final(self, x):
         x = self.final_up(x)
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0,3,1,2)
         x = self.final_conv(x)
         return x
 
@@ -796,5 +760,12 @@ class VSSM(nn.Module):
         x, skip_list = self.forward_features(x)
         x = self.forward_features_up(x, skip_list)
         x = self.forward_final(x)
-
+        
         return x
+
+
+
+
+    
+
+
